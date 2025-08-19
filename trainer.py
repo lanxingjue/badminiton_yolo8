@@ -1,13 +1,14 @@
 """
 模型训练器 - 训练羽毛球动作分类模型
 Linus原则：工具要简单、可靠、可预测
-集成了成功的人体选择算法
+集成了成功的人体选择算法 + GPU优化支持
 """
 
 import os
 import glob
 import cv2
 import torch
+import torch.cuda.amp as amp  # 🔧 混合精度训练
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Tuple, Optional
@@ -20,6 +21,62 @@ from ultralytics import YOLO
 from detector import BadmintonDetector
 from core import Keypoints
 from config import MODEL_CONFIG, TRAINING_CONFIG, RAW_CLASSES
+
+def get_optimal_config():
+    """
+    根据硬件自动优化配置
+    针对RTX 4090等高端GPU进行优化
+    """
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        
+        print(f"🚀 检测到GPU: {gpu_name}")
+        print(f"💾 显存: {vram_gb:.1f}GB")
+        
+        # RTX 4090优化配置
+        if "4090" in gpu_name or "4080" in gpu_name:
+            batch_size = 128  # 4090可以用更大批次
+            num_workers = 12
+            prefetch_factor = 4
+            print("🎯 使用RTX 4090优化配置")
+        elif "3090" in gpu_name or "3080" in gpu_name:
+            batch_size = 96
+            num_workers = 8
+            prefetch_factor = 3
+            print("🎯 使用RTX 30系优化配置")
+        elif "2080" in gpu_name or "2070" in gpu_name:
+            batch_size = 64
+            num_workers = 6
+            prefetch_factor = 2
+            print("🎯 使用RTX 20系优化配置")
+        else:
+            batch_size = 32
+            num_workers = 4
+            prefetch_factor = 2
+            print("🎯 使用通用GPU配置")
+            
+        return {
+            'device': device,
+            'batch_size': batch_size,
+            'num_workers': num_workers,
+            'prefetch_factor': prefetch_factor,
+            'pin_memory': True,
+            'mixed_precision': True,
+            'persistent_workers': True
+        }
+    else:
+        print("⚠️ 未检测到GPU，使用CPU配置")
+        return {
+            'device': torch.device('cpu'),
+            'batch_size': 16,
+            'num_workers': 2,
+            'prefetch_factor': 2,
+            'pin_memory': False,
+            'mixed_precision': False,
+            'persistent_workers': False
+        }
 
 def preprocess_frame(frame):
     """
@@ -143,16 +200,17 @@ def select_nearest_person_keypoints(results, frame_height=640, frame_width=640):
 class VideoBadmintonDataset(Dataset):
     """
     VideoBadminton数据集加载器
-    集成了成功的人体检测逻辑
+    集成了成功的人体检测逻辑 + GPU优化
     """
     
-    def __init__(self, dataset_dir: str, max_samples_per_class: Optional[int] = None):
+    def __init__(self, dataset_dir: str, max_samples_per_class: Optional[int] = None, use_gpu: bool = True):
         """
         初始化数据集
         
         Args:
             dataset_dir: 数据集目录 (如 data/split/train/)
             max_samples_per_class: 每个类别最大样本数，用于限制数据量
+            use_gpu: 是否使用GPU优化模型
         """
         self.dataset_dir = dataset_dir
         self.max_samples_per_class = max_samples_per_class
@@ -162,8 +220,15 @@ class VideoBadmintonDataset(Dataset):
         print(f"📊 总样本数: {len(self.samples)}")
         self._print_class_distribution()
         
-        # 初始化姿态检测器（只用于提取关键点）
-        self.pose_model = YOLO('yolov8n-pose.pt')
+        # 🔧 GPU优化：根据硬件选择更合适的YOLOv8模型
+        if use_gpu and torch.cuda.is_available():
+            # GPU模式使用更大的模型，检测精度更高
+            self.pose_model = YOLO('yolov8m-pose.pt')
+            print("🎯 GPU模式：使用YOLOv8m-pose模型")
+        else:
+            # CPU模式使用轻量级模型
+            self.pose_model = YOLO('yolov8n-pose.pt')
+            print("🎯 CPU模式：使用YOLOv8n-pose模型")
     
     def _collect_samples(self) -> List[Tuple[str, int]]:
         """收集所有视频文件和对应标签"""
@@ -346,23 +411,48 @@ class VideoBadmintonDataset(Dataset):
 
 class Trainer:
     """
-    羽毛球动作分类模型训练器
+    羽毛球动作分类模型训练器 - GPU优化版本
     """
     
-    def __init__(self, data_root: str = "data/split/"):
+    def __init__(self, data_root: str = "data/split/", force_cpu: bool = False):
         """
         初始化训练器
         
         Args:
             data_root: 分割后的数据集根目录
+            force_cpu: 强制使用CPU模式
         """
         self.data_root = data_root
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # 🔧 GPU优化配置
+        if force_cpu:
+            self.config = {
+                'device': torch.device('cpu'),
+                'batch_size': 16,
+                'num_workers': 2,
+                'prefetch_factor': 2,
+                'pin_memory': False,
+                'mixed_precision': False,
+                'persistent_workers': False
+            }
+            print("🔧 强制使用CPU模式")
+        else:
+            self.config = get_optimal_config()
+        
+        self.device = self.config['device']
         
         print("🚀 初始化羽毛球动作分类训练器")
         print(f"🔧 使用设备: {self.device}")
         print(f"📁 数据根目录: {data_root}")
+        print(f"🎯 批次大小: {self.config['batch_size']}")
+        print(f"🎯 工作线程: {self.config['num_workers']}")
+        print(f"🎯 混合精度: {self.config['mixed_precision']}")
         print("🎯 集成了优化的人体选择算法")
+        
+        # 🔧 混合精度训练
+        if self.config['mixed_precision']:
+            self.scaler = amp.GradScaler()
+            print("⚡ 启用混合精度训练加速")
         
         # 验证数据目录
         self._validate_data_directories()
@@ -379,67 +469,90 @@ class Trainer:
     def train(self, epochs: int = TRAINING_CONFIG['max_epochs'], 
               save_path: str = "badminton_model.pth"):
         """
-        训练模型
+        训练模型 - GPU优化版本
         
         Args:
             epochs: 训练轮数
             save_path: 模型保存路径
         """
         print("=" * 60)
-        print("🏸 开始训练羽毛球动作分类模型")
+        print("🏸 开始训练羽毛球动作分类模型 (GPU优化)")
         print("=" * 60)
         
         training_start_time = time.time()
         
         # 加载数据集
         print("📂 正在加载数据集...")
-        train_dataset = VideoBadmintonDataset(f"{self.data_root}/train/")
-        val_dataset = VideoBadmintonDataset(f"{self.data_root}/val/")
-        test_dataset = VideoBadmintonDataset(f"{self.data_root}/test/")
+        use_gpu_models = self.device.type == 'cuda'
+        
+        train_dataset = VideoBadmintonDataset(f"{self.data_root}/train/", use_gpu=use_gpu_models)
+        val_dataset = VideoBadmintonDataset(f"{self.data_root}/val/", use_gpu=use_gpu_models)
+        test_dataset = VideoBadmintonDataset(f"{self.data_root}/test/", use_gpu=use_gpu_models)
         
         print(f"✅ 数据集加载完成")
         print(f"   训练集: {len(train_dataset)} 个样本")
         print(f"   验证集: {len(val_dataset)} 个样本")
         print(f"   测试集: {len(test_dataset)} 个样本")
         
-        # 创建数据加载器
+        # 🔧 GPU优化的数据加载器
         train_loader = DataLoader(
             train_dataset,
-            batch_size=MODEL_CONFIG['batch_size'],
+            batch_size=self.config['batch_size'],
             shuffle=True,
-            num_workers=2,
-            pin_memory=True if self.device.type == 'cuda' else False
+            num_workers=self.config['num_workers'],
+            pin_memory=self.config['pin_memory'],
+            persistent_workers=self.config['persistent_workers'],
+            prefetch_factor=self.config['prefetch_factor'],
+            drop_last=True  # 确保批次大小一致，有利于BatchNorm
         )
         
         val_loader = DataLoader(
             val_dataset,
-            batch_size=MODEL_CONFIG['batch_size'],
+            batch_size=self.config['batch_size'],
             shuffle=False,
-            num_workers=2,
-            pin_memory=True if self.device.type == 'cuda' else False
+            num_workers=self.config['num_workers'],
+            pin_memory=self.config['pin_memory'],
+            persistent_workers=self.config['persistent_workers'],
+            prefetch_factor=self.config['prefetch_factor']
         )
         
         # 初始化模型
         detector = BadmintonDetector()
         model = detector.action_classifier.to(self.device)
         
+        # 🔧 GPU优化：模型编译（PyTorch 2.0+）
+        if torch.cuda.is_available() and hasattr(torch, 'compile'):
+            try:
+                model = torch.compile(model, mode='max-autotune')
+                print("⚡ 模型编译优化成功")
+            except Exception as e:
+                print(f"⚠️ 模型编译失败，使用标准模式: {e}")
+        
         # 训练配置
         criterion = torch.nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(
+        
+        # 🔧 GPU优化：使用AdamW优化器和学习率scaling
+        base_lr = MODEL_CONFIG['learning_rate']
+        scaled_lr = base_lr * (self.config['batch_size'] / 16)  # 根据批次大小调整学习率
+        
+        optimizer = torch.optim.AdamW(
             model.parameters(),
-            lr=MODEL_CONFIG['learning_rate'],
-            weight_decay=MODEL_CONFIG['weight_decay']
+            lr=scaled_lr,
+            weight_decay=MODEL_CONFIG['weight_decay'],
+            betas=(0.9, 0.999),
+            eps=1e-8
         )
+        
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
             patience=TRAINING_CONFIG['lr_scheduler_patience'],
-            factor=0.5
+            factor=0.5,
+            verbose=True
         )
         
         # 训练状态跟踪
         best_val_accuracy = 0.0
-        best_val_loss = float('inf')
         epochs_without_improvement = 0
         training_history = {
             'train_loss': [],
@@ -449,10 +562,10 @@ class Trainer:
             'learning_rate': []
         }
         
-        print(f"🔧 训练配置:")
-        print(f"   批次大小: {MODEL_CONFIG['batch_size']}")
-        print(f"   学习率: {MODEL_CONFIG['learning_rate']}")
-        print(f"   权重衰减: {MODEL_CONFIG['weight_decay']}")
+        print(f"🔧 GPU训练配置:")
+        print(f"   批次大小: {self.config['batch_size']}")
+        print(f"   基础学习率: {base_lr:.6f}")
+        print(f"   缩放学习率: {scaled_lr:.6f}")
         print(f"   最大轮数: {epochs}")
         print("-" * 40)
         
@@ -464,7 +577,10 @@ class Trainer:
             print("-" * 30)
             
             # 训练阶段
-            train_loss, train_acc = self._train_epoch(model, train_loader, criterion, optimizer)
+            if self.config['mixed_precision']:
+                train_loss, train_acc = self._train_epoch_amp(model, train_loader, criterion, optimizer)
+            else:
+                train_loss, train_acc = self._train_epoch(model, train_loader, criterion, optimizer)
             
             # 验证阶段
             val_loss, val_acc = self._validate_epoch(model, val_loader, criterion)
@@ -482,19 +598,26 @@ class Trainer:
             
             # 显示当前轮结果
             epoch_time = time.time() - epoch_start_time
+            
+            # 🔧 GPU内存监控
+            if torch.cuda.is_available():
+                gpu_memory_used = torch.cuda.max_memory_allocated() / 1024**3
+                gpu_memory_cached = torch.cuda.max_memory_reserved() / 1024**3
+                gpu_info = f"| GPU内存: {gpu_memory_used:.1f}GB/{gpu_memory_cached:.1f}GB"
+            else:
+                gpu_info = ""
+            
             print(f"📊 训练损失: {train_loss:.4f} | 训练准确率: {train_acc:.2f}%")
             print(f"📊 验证损失: {val_loss:.4f} | 验证准确率: {val_acc:.2f}%")
-            print(f"⏱️  轮次耗时: {epoch_time:.1f}秒 | 学习率: {current_lr:.6f}")
+            print(f"⏱️  轮次耗时: {epoch_time:.1f}秒 {gpu_info} | 学习率: {current_lr:.6f}")
             
             # 保存最佳模型
             if val_acc > best_val_accuracy:
                 best_val_accuracy = val_acc
-                best_val_loss = val_loss
                 epochs_without_improvement = 0
                 
-                if TRAINING_CONFIG['save_best_only']:
-                    torch.save(model.state_dict(), save_path)
-                    print(f"🎯 新的最佳模型！验证准确率: {val_acc:.2f}% (已保存)")
+                torch.save(model.state_dict(), save_path)
+                print(f"🎯 新的最佳模型！验证准确率: {val_acc:.2f}% (已保存)")
             else:
                 epochs_without_improvement += 1
             
@@ -502,6 +625,10 @@ class Trainer:
             if epochs_without_improvement >= TRAINING_CONFIG['early_stopping_patience']:
                 print(f"⏹️  早停触发！{epochs_without_improvement} 轮无改进")
                 break
+            
+            # 🔧 清理GPU缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # 训练结束统计
         total_training_time = time.time() - training_start_time
@@ -521,23 +648,62 @@ class Trainer:
         if os.path.exists(save_path):
             self._final_evaluation(test_dataset, save_path)
     
-    def _train_epoch(self, model, train_loader, criterion, optimizer) -> Tuple[float, float]:
-        """训练一个epoch"""
+    def _train_epoch_amp(self, model, train_loader, criterion, optimizer) -> Tuple[float, float]:
+        """训练一个epoch - 混合精度版本"""
         model.train()
         total_loss = 0.0
         correct = 0
         total = 0
         
         for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(self.device), target.to(self.device)
+            data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
             
-            # 前向传播
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
+            
+            # 🔧 混合精度前向传播
+            with amp.autocast():
+                output = model(data)
+                loss = criterion(output, target)
+            
+            # 🔧 混合精度反向传播
+            self.scaler.scale(loss).backward()
+            self.scaler.step(optimizer)
+            self.scaler.update()
+            
+            # 统计
+            total_loss += loss.item()
+            _, predicted = torch.max(output.data, 1)
+            total += target.size(0)
+            correct += (predicted == target).sum().item()
+            
+            # 显示进度
+            if batch_idx % 50 == 0:  # GPU训练更快，减少输出频率
+                current_acc = 100.0 * correct / total
+                print(f"  📦 批次 {batch_idx}/{len(train_loader)} | "
+                      f"损失: {loss.item():.4f} | 准确率: {current_acc:.2f}%")
+        
+        avg_loss = total_loss / len(train_loader)
+        accuracy = 100.0 * correct / total
+        return avg_loss, accuracy
+    
+    def _train_epoch(self, model, train_loader, criterion, optimizer) -> Tuple[float, float]:
+        """训练一个epoch - 标准版本"""
+        model.train()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
+            
+            optimizer.zero_grad(set_to_none=True)
             output = model(data)
             loss = criterion(output, target)
-            
-            # 反向传播
             loss.backward()
+            
+            # 🔧 梯度裁剪防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             # 统计
@@ -547,7 +713,7 @@ class Trainer:
             correct += (predicted == target).sum().item()
             
             # 显示进度
-            if batch_idx % 20 == 0:  # 减少输出频率
+            if batch_idx % 50 == 0:
                 current_acc = 100.0 * correct / total
                 print(f"  📦 批次 {batch_idx}/{len(train_loader)} | "
                       f"损失: {loss.item():.4f} | 准确率: {current_acc:.2f}%")
@@ -565,9 +731,15 @@ class Trainer:
         
         with torch.no_grad():
             for data, target in val_loader:
-                data, target = data.to(self.device), target.to(self.device)
-                output = model(data)
-                loss = criterion(output, target)
+                data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
+                
+                if self.config['mixed_precision']:
+                    with amp.autocast():
+                        output = model(data)
+                        loss = criterion(output, target)
+                else:
+                    output = model(data)
+                    loss = criterion(output, target)
                 
                 total_loss += loss.item()
                 _, predicted = torch.max(output.data, 1)
@@ -586,8 +758,10 @@ class Trainer:
         
         test_loader = DataLoader(
             test_dataset,
-            batch_size=MODEL_CONFIG['batch_size'],
-            shuffle=False
+            batch_size=self.config['batch_size'],
+            shuffle=False,
+            num_workers=self.config['num_workers'],
+            pin_memory=self.config['pin_memory']
         )
         
         # 加载最佳模型
@@ -600,22 +774,22 @@ class Trainer:
         correct = 0
         total = 0
         class_correct = [0] * 18
-        class_total =  [0] * 18
-        all_predictions = []
-        all_targets = []
+        class_total = [0] * 18
         
         with torch.no_grad():
             for data, target in test_loader:
-                data, target = data.to(self.device), target.to(self.device)
-                output = model(data)
+                data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
+                
+                if self.config['mixed_precision']:
+                    with amp.autocast():
+                        output = model(data)
+                else:
+                    output = model(data)
+                
                 _, predicted = torch.max(output, 1)
                 
                 total += target.size(0)
                 correct += (predicted == target).sum().item()
-                
-                # 记录预测和真实标签
-                all_predictions.extend(predicted.cpu().numpy())
-                all_targets.extend(target.cpu().numpy())
                 
                 # 按类别统计
                 for i in range(target.size(0)):
@@ -647,22 +821,25 @@ def main():
     """主函数"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="训练羽毛球动作分类模型")
+    parser = argparse.ArgumentParser(description="训练羽毛球动作分类模型 (GPU优化)")
     parser.add_argument("--data", default="data/split/", 
                        help="分割后的数据集根目录")
     parser.add_argument("--epochs", type=int, default=TRAINING_CONFIG['max_epochs'], 
                        help="训练轮数")
-    parser.add_argument("--output", default="badminton_model.pth", 
+    parser.add_argument("--output", default="badminton_model_gpu.pth", 
                        help="模型输出路径")
-    parser.add_argument("--batch-size", type=int, default=MODEL_CONFIG['batch_size'], 
-                       help="批次大小")
+    parser.add_argument("--batch-size", type=int, default=None, 
+                       help="批次大小（留空自动优化）")
     parser.add_argument("--lr", type=float, default=MODEL_CONFIG['learning_rate'], 
                        help="学习率")
+    parser.add_argument("--cpu", action="store_true", 
+                       help="强制使用CPU模式")
     
     args = parser.parse_args()
     
     # 更新配置
-    MODEL_CONFIG['batch_size'] = args.batch_size
+    if args.batch_size:
+        MODEL_CONFIG['batch_size'] = args.batch_size
     MODEL_CONFIG['learning_rate'] = args.lr
     
     # 设置随机种子确保可重现
@@ -670,8 +847,15 @@ def main():
     np.random.seed(42)
     random.seed(42)
     
+    # 🔧 GPU优化设置
+    if torch.cuda.is_available() and not args.cpu:
+        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+        torch.backends.cudnn.deterministic = False  # 允许非确定性以提高性能
+        torch.backends.cudnn.benchmark = True       # 优化卷积性能
+    
     # 开始训练
-    trainer = Trainer(args.data)
+    trainer = Trainer(args.data, force_cpu=args.cpu)
     trainer.train(epochs=args.epochs, save_path=args.output)
 
 if __name__ == "__main__":
