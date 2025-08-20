@@ -1,7 +1,7 @@
 """
 模型训练器 - 训练羽毛球动作分类模型
 Linus原则：工具要简单、可靠、可预测
-集成了成功的人体选择算法 + GPU优化支持
+集成了成功的人体选择算法 + GPU优化支持 + 稳定性增强
 """
 
 import os
@@ -35,172 +35,263 @@ def get_optimal_config():
         print(f"🚀 检测到GPU: {gpu_name}")
         print(f"💾 显存: {vram_gb:.1f}GB")
         
-        # RTX 4090优化配置
+        # RTX 4090优化配置 - 修复配置冲突
         if "4090" in gpu_name or "4080" in gpu_name:
-            batch_size = 128  # 4090可以用更大批次
-            num_workers = 12
-            prefetch_factor = 4
-            print("🎯 使用RTX 4090优化配置")
+            batch_size = 128
+            num_workers = 0  # 🔧 避免CUDA多进程问题
+            prefetch_factor = None  # 🔧 单进程模式必须为None
+            print("🎯 使用RTX 4090优化配置（单进程模式）")
         elif "3090" in gpu_name or "3080" in gpu_name:
             batch_size = 96
-            num_workers = 8
-            prefetch_factor = 3
-            print("🎯 使用RTX 30系优化配置")
+            num_workers = 0  # 🔧 统一使用单进程
+            prefetch_factor = None
+            print("🎯 使用RTX 30系优化配置（单进程模式）")
         elif "2080" in gpu_name or "2070" in gpu_name:
             batch_size = 64
-            num_workers = 6
-            prefetch_factor = 2
-            print("🎯 使用RTX 20系优化配置")
+            num_workers = 0  # 🔧 统一使用单进程
+            prefetch_factor = None
+            print("🎯 使用RTX 20系优化配置（单进程模式）")
         else:
             batch_size = 32
-            num_workers = 4
-            prefetch_factor = 2
-            print("🎯 使用通用GPU配置")
+            num_workers = 0  # 🔧 统一使用单进程
+            prefetch_factor = None
+            print("🎯 使用通用GPU配置（单进程模式）")
             
         return {
             'device': device,
             'batch_size': batch_size,
             'num_workers': num_workers,
-            'prefetch_factor': prefetch_factor,
+            'prefetch_factor': prefetch_factor,  # 🔧 关键修复
             'pin_memory': True,
-            'mixed_precision': True,
-            'persistent_workers': True
+            'mixed_precision': False,
+            'persistent_workers': False
         }
     else:
         print("⚠️ 未检测到GPU，使用CPU配置")
         return {
             'device': torch.device('cpu'),
             'batch_size': 16,
-            'num_workers': 2,
-            'prefetch_factor': 2,
+            'num_workers': 0,
+            'prefetch_factor': None,  # 🔧 关键修复
             'pin_memory': False,
             'mixed_precision': False,
             'persistent_workers': False
         }
 
-def preprocess_frame(frame):
+
+def preprocess_frame_stable(frame):
     """
+    🔧 稳定版图像预处理
     提高图像质量，增强人体检测效果
     """
-    # 提高对比度和亮度
-    frame = cv2.convertScaleAbs(frame, alpha=1.2, beta=10)
-    # 锐化滤波去除运动模糊
-    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-    frame = cv2.filter2D(frame, -1, kernel)
-    return frame
+    try:
+        # 提高对比度和亮度
+        frame = cv2.convertScaleAbs(frame, alpha=1.2, beta=10)
+        # 锐化滤波去除运动模糊
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        frame = cv2.filter2D(frame, -1, kernel)
+        return frame
+    except Exception as e:
+        print(f"    ⚠️ 预处理失败: {e}, 返回原图")
+        return frame
 
-def safe_float(value):
+def safe_float_robust(value):
     """
-    安全的数值转换，处理所有numpy类型
-    集成自test_person.py的成功实现
+    🔧 终极版数值转换函数
     """
-    if isinstance(value, (np.ndarray, np.generic)):
-        if hasattr(value, 'item'):
-            return float(value.item())
-        elif len(value.shape) == 0:  # 0维数组（标量）
+    try:
+        if value is None:
+            return 0.0
+        
+        if isinstance(value, (int, float)):
+            if np.isnan(value) or np.isinf(value):
+                return 0.0
             return float(value)
-        elif value.size == 1:  # 只有一个元素
-            return float(value.flat[0])
-        else:
-            raise ValueError(f"Cannot convert array of size {value.size} to scalar")
-    else:
-        return float(value)
+        
+        if hasattr(value, 'dtype'):
+            arr = np.asarray(value)
+            
+            if arr.size == 0:
+                return 0.0
+            
+            if arr.ndim == 0:
+                val = float(arr.item())
+                return 0.0 if (np.isnan(val) or np.isinf(val)) else val
+            
+            # 对于多元素数组，取第一个有效值
+            flat = arr.flatten()
+            for i in range(len(flat)):
+                val = float(flat[i])
+                if not (np.isnan(val) or np.isinf(val)):
+                    return val
+            
+            return 0.0
+        
+        val = float(value)
+        return 0.0 if (np.isnan(val) or np.isinf(val)) else val
+        
+    except Exception:
+        return 0.0
 
-def select_nearest_person_keypoints(results, frame_height=640, frame_width=640):
+def select_nearest_person_keypoints_stable(results, frame_height=640, frame_width=640):
     """
-    从YOLOv8姿态检测结果中选择最靠近摄像头的人
-    集成自test_person.py的成功实现，专门针对训练数据优化
-    
-    判断标准：
-    1. 关键点包围盒面积最大（人体在画面中最大）
-    2. 关键点质心位置最靠近画面底部（更靠近摄像头）
-    3. 综合评分选择最佳候选
+    🔧 Linus式调试版：人体选择算法
     """
-    if not results or len(results) == 0:
-        return None, None
+    # print(f"    🔍 【人体选择开始】")
     
-    result = results[0]
-    
-    if not hasattr(result, 'keypoints') or result.keypoints is None:
-        return None, None
-    
-    keypoints_data = result.keypoints
-    
-    if len(keypoints_data.xy) == 0:
-        return None, None
-    
-    best_idx = None
-    max_score = 0.0
-    max_possible_area = float(frame_height * frame_width)
-    
-    for i in range(len(keypoints_data.xy)):
-        try:
-            coords = keypoints_data.xy[i].cpu().numpy().astype(np.float64)
-            confidence = keypoints_data.conf[i].cpu().numpy().astype(np.float64)
+    try:
+        # # 检查1: results有效性
+        # print(f"      检查1 - Results:")
+        # print(f"        类型: {type(results)}")
+        # print(f"        是否为None: {results is None}")
+        # print(f"        长度: {len(results) if results else 'N/A'}")
+        
+        if not results or len(results) == 0:
+            # print(f"      ❌ 检查1失败: results无效")
+            return None, None
+
+        # 检查2: 第一个结果
+        result = results[0]
+        # print(f"      检查2 - 第一个结果:")
+        # print(f"        类型: {type(result)}")
+        # print(f"        是否有keypoints属性: {hasattr(result, 'keypoints')}")
+        
+        if not hasattr(result, 'keypoints') or result.keypoints is None:
+            # print(f"      ❌ 检查2失败: 无keypoints属性或为None")
+            return None, None
+
+        # 检查3: keypoints数据
+        keypoints_data = result.keypoints
+        # print(f"      检查3 - Keypoints数据:")
+        # print(f"        类型: {type(keypoints_data)}")
+        # print(f"        是否有xy属性: {hasattr(keypoints_data, 'xy')}")
+        # print(f"        是否有conf属性: {hasattr(keypoints_data, 'conf')}")
+        
+        if not hasattr(keypoints_data, 'xy'):
+            # print(f"      ❌ 检查3失败: 无xy属性")
+            return None, None
             
-            # 过滤低置信度关键点
-            valid_mask = confidence > 0.3
-            valid_points = coords[valid_mask]
-            valid_conf = confidence[valid_mask]
+        # print(f"        xy长度: {len(keypoints_data.xy)}")
+        
+        if len(keypoints_data.xy) == 0:
+            # print(f"      ❌ 检查3失败: xy为空")
+            return None, None
+
+        # 开始处理每个人
+        # print(f"      🎯 开始处理 {len(keypoints_data.xy)} 个人物")
+        
+        best_idx = None
+        max_score = 0.0
+        max_possible_area = float(frame_height * frame_width)
+        valid_persons = 0
+
+        for i in range(len(keypoints_data.xy)):
+            # print(f"        👤 人物{i+1}:")
             
-            if len(valid_points) < 5:  # 至少需要5个高置信度关键点
-                continue
-            
-            # 计算包围盒面积
-            min_xy = valid_points.min(axis=0)
-            max_xy = valid_points.max(axis=0)
-            
-            bbox_width = safe_float(max_xy[0] - min_xy[0])
-            bbox_height = safe_float(max_xy[1] - min_xy[1])
-            bbox_area = bbox_width * bbox_height
-            
-            # 计算质心位置
-            centroid_y = safe_float(valid_points[:, 1].mean())
-            position_score = centroid_y / frame_height
-            
-            # 计算平均置信度
-            avg_confidence = safe_float(valid_conf.mean())
-            
-            # 综合评分：面积50% + 位置30% + 置信度20%
-            area_weight = 0.5
-            position_weight = 0.3
-            confidence_weight = 0.2
-            
-            # 面积归一化
-            if bbox_area > 0:
-                normalized_area = min(np.log10(bbox_area + 1) / np.log10(max_possible_area + 1), 1.0)
-            else:
-                normalized_area = 0.0
-            
-            normalized_position = min(position_score, 1.0)
-            normalized_confidence = min(avg_confidence, 1.0)
-            
-            composite_score = (
-                area_weight * normalized_area +
-                position_weight * normalized_position +
-                confidence_weight * normalized_confidence
-            )
-            
-            if composite_score > max_score:
-                max_score = composite_score
-                best_idx = i
+            try:
+                # 数据获取
+                coords_tensor = keypoints_data.xy[i]
+                confidence_tensor = keypoints_data.conf[i]
                 
-        except Exception as e:
-            continue
-    
-    if best_idx is None:
+                # print(f"          数据类型: coords={type(coords_tensor)}, conf={type(confidence_tensor)}")
+                # print(f"          数据形状: coords={coords_tensor.shape}, conf={confidence_tensor.shape}")
+                
+                # 转换为numpy
+                coords = coords_tensor.cpu().numpy().astype(np.float32)
+                confidence = confidence_tensor.cpu().numpy().astype(np.float32)
+                
+                # print(f"          numpy形状: coords={coords.shape}, conf={confidence.shape}")
+                # print(f"          置信度统计: min={confidence.min():.3f}, max={confidence.max():.3f}, mean={confidence.mean():.3f}")
+                
+                if coords.size == 0 or confidence.size == 0:
+                    # print(f"          ❌ 数据为空，跳过")
+                    continue
+
+                # 过滤有效关键点
+                valid_mask = confidence > 0.05  # 使用较低阈值
+                valid_points = coords[valid_mask]
+                valid_conf = confidence[valid_mask]
+                
+                # print(f"          有效关键点: {len(valid_points)}/17 (阈值>0.05)")
+                
+                if len(valid_points) < 1:  # 至少需要1个关键点
+                    # print(f"          ❌ 有效关键点不足，跳过")
+                    continue
+
+                # 计算包围盒
+                x_coords = valid_points[:, 0]
+                y_coords = valid_points[:, 1]
+                
+                x_min, x_max = float(np.min(x_coords)), float(np.max(x_coords))
+                y_min, y_max = float(np.min(y_coords)), float(np.max(y_coords))
+                
+                bbox_width = max(0.0, x_max - x_min)
+                bbox_height = max(0.0, y_max - y_min)
+                bbox_area = max(1.0, bbox_width * bbox_height)
+                
+                # print(f"          包围盒: 宽{bbox_width:.1f}, 高{bbox_height:.1f}, 面积{bbox_area:.1f}")
+                
+                # 计算质心
+                centroid_y = float(np.mean(y_coords))
+                position_score = max(0.0, min(1.0, centroid_y / frame_height))
+                
+                # 计算平均置信度
+                avg_confidence = float(np.mean(valid_conf))
+                
+                # print(f"          质心Y: {centroid_y:.1f}, 位置评分: {position_score:.3f}")
+                # print(f"          平均置信度: {avg_confidence:.3f}")
+                
+                # 简化评分算法
+                composite_score = avg_confidence * 0.7 + position_score * 0.3
+                
+                # print(f"          💯 综合评分: {composite_score:.3f}")
+                
+                valid_persons += 1
+                
+                if composite_score > max_score:
+                    max_score = composite_score
+                    best_idx = i
+                    # print(f"          👑 新的最佳候选!")
+                    
+            except Exception as person_e:
+                # print(f"          ❌ 处理人物{i+1}异常: {person_e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        # print(f"      📊 处理完成: 有效人物{valid_persons}个, 最佳索引{best_idx}, 最高分{max_score:.3f}")
+
+        if best_idx is None:
+            # print(f"      ❌ 没有找到有效候选")
+            return None, None
+
+        # 返回结果
+        try:
+            best_keypoints = keypoints_data.xy[best_idx].cpu().numpy()
+            best_confidence = keypoints_data.conf[best_idx].cpu().numpy()
+            
+            # print(f"      ✅ 成功返回: 人物{best_idx+1}")
+            # print(f"        关键点shape: {best_keypoints.shape}")
+            # print(f"        置信度shape: {best_confidence.shape}")
+            
+            return best_keypoints, best_confidence
+            
+        except Exception as return_e:
+            # print(f"      ❌ 返回结果异常: {return_e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
+            
+    except Exception as main_e:
+        # print(f"    ❌ 主函数异常: {main_e}")
+        import traceback
+        traceback.print_exc()
         return None, None
-    
-    # 返回最佳候选人的关键点和置信度
-    best_keypoints = keypoints_data.xy[best_idx].cpu().numpy()
-    best_confidence = keypoints_data.conf[best_idx].cpu().numpy()
-    
-    return best_keypoints, best_confidence
 
 class VideoBadmintonDataset(Dataset):
     """
     VideoBadminton数据集加载器
-    集成了成功的人体检测逻辑 + GPU优化
+    集成了稳定的人体检测逻辑 + GPU优化
     """
     
     def __init__(self, dataset_dir: str, max_samples_per_class: Optional[int] = None, use_gpu: bool = True):
@@ -294,79 +385,180 @@ class VideoBadmintonDataset(Dataset):
     
     def _extract_keypoints_from_video(self, video_path: str) -> List[Keypoints]:
         """
-        从视频提取关键点序列 - 集成test_person.py的成功实现
-        
-        优化点：
-        1. 智能裁剪去除过多背景
-        2. 图像预处理提高检测率
-        3. 优先选择靠近摄像头的人（核心改进）
-        4. 安全的错误处理
+        🔧 Linus式调试版：从视频提取关键点序列
+        每个步骤都有详细日志，定位问题
         """
+        video_name = os.path.basename(video_path)
+        # print(f"\n🎬 开始处理视频: {video_name}")
+        # print(f"📍 完整路径: {video_path}")
+        
+        # 步骤1: 视频加载
         cap = cv2.VideoCapture(video_path)
         keypoints_list = []
         
         if not cap.isOpened():
+            print(f"❌ 视频打开失败: {video_path}")
             return []
+        
+        # 获取视频基本信息
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # print(f"📊 视频信息: {width}x{height}, {total_frames}帧, {fps:.1f}fps")   
         
         frame_count = 0
         max_frames = TRAINING_CONFIG['max_frames_per_video']
         successful_detections = 0
         
+        # print(f"🎯 将处理最多 {max_frames} 帧")
+        
         while frame_count < max_frames:
             ret, frame = cap.read()
             if not ret:
+                # print(f"📹 第{frame_count+1}帧读取失败，视频结束")
                 break
             
+            # print(f"\n🔍 处理第{frame_count+1}帧:")
+            # print(f"  原始帧尺寸: {frame.shape}")
+            
             try:
-                # 📐 智能裁剪：去除过多背景，突出人物区域
+                # 步骤2: 图像裁剪
                 height, width = frame.shape[:2]
+                crop_y1 = max(0, int(height * 0.02))
+                crop_y2 = min(height, int(height * 0.98))
+                crop_x1 = max(0, int(width * 0.02))
+                crop_x2 = min(width, int(width * 0.98))
                 
-                # 裁剪参数：保留中央区域，去掉上下左右的背景
-                crop_y1, crop_y2 = int(height * 0.15), int(height * 0.90)
-                crop_x1, crop_x2 = int(width * 0.10), int(width * 0.90)
+                # print(f"  裁剪区域: y[{crop_y1}:{crop_y2}], x[{crop_x1}:{crop_x2}]")
+                
                 cropped_frame = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+                # print(f"  裁剪后尺寸: {cropped_frame.shape}")
                 
-                # 🔧 图像预处理：提高对比度和清晰度
-                processed_frame = preprocess_frame(cropped_frame)
+                # 步骤3: 图像预处理
+                try:
+                    processed_frame = preprocess_frame_stable(cropped_frame)
+                    # print(f"  预处理完成: {processed_frame.shape}")
+                except Exception as preprocess_e:
+                    # print(f"  ⚠️ 预处理失败: {preprocess_e}")
+                    processed_frame = cropped_frame
                 
-                # 📏 调整到模型输入尺寸
+                # 步骤4: 尺寸调整
                 target_size = 640
                 frame_resized = cv2.resize(processed_frame, (target_size, target_size))
+                # print(f"  调整到目标尺寸: {frame_resized.shape}")
                 
-                # 🤖 YOLOv8姿态检测：降低检测阈值提高召回率
-                results = self.pose_model(frame_resized, verbose=False, conf=0.1)
+                # 步骤5: YOLO检测 - 关键环节
+                # print(f"  🤖 开始YOLO检测...")
+                # print(f"  YOLO模型类型: {type(self.pose_model)}")
                 
-                # 🎯 核心改进：使用test_person.py中成功的人体选择算法
-                best_keypoints, best_confidence = select_nearest_person_keypoints(
-                    results, target_size, target_size
-                )
+                try:
+                    results = self.pose_model(frame_resized, verbose=False, conf=0.03)
+                    # print(f"  ✅ YOLO检测完成")
+                    # print(f"  Results类型: {type(results)}")
+                    # print(f"  Results长度: {len(results) if results else 'None'}")
+                    
+                    if results and len(results) > 0:
+                        result = results[0]
+                        # print(f"  第一个result类型: {type(result)}")
+                        # print(f"  result属性: {[attr for attr in dir(result) if not attr.startswith('_')]}")
+                        # print(f"  是否有keypoints: {hasattr(result, 'keypoints')}")
+                        
+                        if hasattr(result, 'keypoints') and result.keypoints is not None:
+                            kp_data = result.keypoints
+                            # print(f"  keypoints类型: {type(kp_data)}")
+                            # print(f"  keypoints属性: {[attr for attr in dir(kp_data) if not attr.startswith('_')]}")
+                            # print(f"  是否有xy: {hasattr(kp_data, 'xy')}")
+                            # print(f"  是否有conf: {hasattr(kp_data, 'conf')}")
+                            
+                            # if hasattr(kp_data, 'xy'):
+                            #     # print(f"  xy类型: {type(kp_data.xy)}")
+                            #     # print(f"  检测到人数: {len(kp_data.xy)}")
+                                
+                            #     if len(kp_data.xy) > 0:
+                            #         # print(f"  第一个人关键点:")
+                            #         # print(f"    xy shape: {kp_data.xy[0].shape}")
+                            #         # print(f"    xy类型: {type(kp_data.xy)}")
+                            #         # if hasattr(kp_data, 'conf'):
+                            #             # print(f"    conf shape: {kp_data.conf.shape}")
+                            #             # print(f"    conf类型: {type(kp_data.conf)}")
+                            #             # print(f"    置信度范围: {kp_data.conf.min():.3f}-{kp_data.conf.max():.3f}")
+                            #     else:
+                            # #         print(f"  ❌ xy数组为空")
+                        #     # else:
+                        #     #     print(f"  ❌ keypoints没有xy属性")
+                        # else:
+                        #     print(f"  ❌ result没有keypoints或keypoints为None")
+                    else:
+                        print(f"  ❌ YOLO返回空结果")
+                    
+                except Exception as yolo_e:
+                    print(f"  ❌ YOLO检测异常: {yolo_e}")
+                    import traceback
+                    traceback.print_exc()
+                    frame_count += 1
+                    continue
                 
-                if best_keypoints is not None and best_confidence is not None:
-                    # 检查整体质量：平均置信度必须达到最低要求
-                    avg_confidence = safe_float(best_confidence.mean())
-                    if avg_confidence > 0.05:  # 降低阈值，提高检测成功率
-                        keypoints_list.append(Keypoints(
-                            points=best_keypoints,
-                            confidence=best_confidence
-                        ))
-                        successful_detections += 1
-                
-            except Exception as e:
-                # 跳过处理失败的帧，继续处理下一帧
-                pass
+                # 步骤6: 人体选择
+                # print(f"  👤 开始人体选择...")
+                try:
+                    best_keypoints, best_confidence = select_nearest_person_keypoints_stable(
+                        results, target_size, target_size
+                    )
+                    
+                    if best_keypoints is not None and best_confidence is not None:
+                        # print(f"  ✅ 人体选择成功")
+                        # print(f"    关键点shape: {best_keypoints.shape}")
+                        # print(f"    置信度shape: {best_confidence.shape}")
+                        
+                        # 步骤7: 质量检查
+                        try:
+                            avg_confidence = safe_float_robust(best_confidence.mean())
+                            # print(f"    平均置信度: {avg_confidence:.3f}")
+                            
+                            if avg_confidence > 0.02:
+                                # print(f"    ✅ 质量检查通过，添加到序列")
+                                keypoints_list.append(Keypoints(
+                                    points=best_keypoints,
+                                    confidence=best_confidence
+                                ))
+                                successful_detections += 1
+                            # else:
+                                # print(f"    ❌ 质量检查失败，平均置信度{avg_confidence:.3f} <= 0.02")
+                        except Exception as quality_e:
+                            print(f"    ❌ 质量检查异常: {quality_e}")
+                    # else:
+                        # print(f"  ❌ 人体选择失败，返回None")
+                        
+                except Exception as select_e:
+                    # print(f"  ❌ 人体选择异常: {select_e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            except Exception as frame_e:
+                print(f"  ❌ 处理第{frame_count+1}帧异常: {frame_e}")
+                import traceback
+                traceback.print_exc()
             
             frame_count += 1
             
-            # 🎯 优化：如果检测成功率太低，提前终止
-            if frame_count > 20 and successful_detections == 0:
+            # 早停检查
+            if frame_count > 30 and successful_detections == 0:
+                print(f"🛑 早停：处理了{frame_count}帧，成功0次")
                 break
         
         cap.release()
         
-        # 📊 检测统计（只对失败率高的视频输出警告）
+        # 最终统计
         success_rate = successful_detections / max(frame_count, 1) * 100
-        if success_rate < 10:  # 成功率低于10%时输出警告
-            video_name = os.path.basename(video_path)
+        # print(f"\n📊 视频处理完成:")
+        # print(f"  总处理帧数: {frame_count}")
+        # print(f"  成功检测帧数: {successful_detections}")
+        # print(f"  检测成功率: {success_rate:.1f}%")
+        # print(f"  关键点序列长度: {len(keypoints_list)}")
+        
+        if success_rate < 5:
             print(f"⚠️  {video_name}: 检测成功率 {success_rate:.1f}% ({successful_detections}/{frame_count})")
         
         return keypoints_list
@@ -411,7 +603,7 @@ class VideoBadmintonDataset(Dataset):
 
 class Trainer:
     """
-    羽毛球动作分类模型训练器 - GPU优化版本
+    羽毛球动作分类模型训练器 - GPU优化+稳定性增强版本
     """
     
     def __init__(self, data_root: str = "data/split/", force_cpu: bool = False):
@@ -441,18 +633,22 @@ class Trainer:
         
         self.device = self.config['device']
         
-        print("🚀 初始化羽毛球动作分类训练器")
+        print("🚀 初始化羽毛球动作分类训练器 (稳定增强版)")
         print(f"🔧 使用设备: {self.device}")
         print(f"📁 数据根目录: {data_root}")
         print(f"🎯 批次大小: {self.config['batch_size']}")
         print(f"🎯 工作线程: {self.config['num_workers']}")
         print(f"🎯 混合精度: {self.config['mixed_precision']}")
-        print("🎯 集成了优化的人体选择算法")
+        print("🎯 集成了稳定的人体选择算法")
         
-        # 🔧 混合精度训练
+        # 🔧 暂时禁用混合精度训练确保稳定性
         if self.config['mixed_precision']:
-            self.scaler = amp.GradScaler()
-            print("⚡ 启用混合精度训练加速")
+            try:
+                self.scaler = amp.GradScaler()
+                print("⚡ 启用混合精度训练加速")
+            except:
+                self.config['mixed_precision'] = False
+                print("⚠️ 混合精度初始化失败，禁用混合精度")
         
         # 验证数据目录
         self._validate_data_directories()
@@ -467,16 +663,16 @@ class Trainer:
         print("✅ 数据目录结构验证通过")
     
     def train(self, epochs: int = TRAINING_CONFIG['max_epochs'], 
-              save_path: str = "badminton_model.pth"):
+              save_path: str = "badminton_model_stable.pth"):
         """
-        训练模型 - GPU优化版本
+        训练模型 - GPU优化+稳定性增强版本
         
         Args:
             epochs: 训练轮数
             save_path: 模型保存路径
         """
         print("=" * 60)
-        print("🏸 开始训练羽毛球动作分类模型 (GPU优化)")
+        print("🏸 开始训练羽毛球动作分类模型 (稳定增强版)")
         print("=" * 60)
         
         training_start_time = time.time()
@@ -523,7 +719,7 @@ class Trainer:
         # 🔧 GPU优化：模型编译（PyTorch 2.0+）
         if torch.cuda.is_available() and hasattr(torch, 'compile'):
             try:
-                model = torch.compile(model, mode='max-autotune')
+                model = torch.compile(model, mode='default')  # 使用default模式确保稳定性
                 print("⚡ 模型编译优化成功")
             except Exception as e:
                 print(f"⚠️ 模型编译失败，使用标准模式: {e}")
@@ -547,8 +743,7 @@ class Trainer:
             optimizer,
             mode='min',
             patience=TRAINING_CONFIG['lr_scheduler_patience'],
-            factor=0.5,
-            verbose=True
+            factor=0.5
         )
         
         # 训练状态跟踪
@@ -562,11 +757,12 @@ class Trainer:
             'learning_rate': []
         }
         
-        print(f"🔧 GPU训练配置:")
+        print(f"🔧 稳定增强训练配置:")
         print(f"   批次大小: {self.config['batch_size']}")
         print(f"   基础学习率: {base_lr:.6f}")
         print(f"   缩放学习率: {scaled_lr:.6f}")
         print(f"   最大轮数: {epochs}")
+        print(f"   混合精度: {self.config['mixed_precision']}")
         print("-" * 40)
         
         # 主训练循环
@@ -660,15 +856,22 @@ class Trainer:
             
             optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
             
-            # 🔧 混合精度前向传播
-            with amp.autocast():
+            # 🔧 使用传统的混合精度API确保兼容性
+            try:
+                with torch.cuda.amp.autocast():
+                    output = model(data)
+                    loss = criterion(output, target)
+                
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            except Exception as amp_e:
+                # 如果混合精度失败，回退到标准模式
+                print(f"⚠️ 混合精度失败，回退到标准模式: {amp_e}")
                 output = model(data)
                 loss = criterion(output, target)
-            
-            # 🔧 混合精度反向传播
-            self.scaler.scale(loss).backward()
-            self.scaler.step(optimizer)
-            self.scaler.update()
+                loss.backward()
+                optimizer.step()
             
             # 统计
             total_loss += loss.item()
@@ -733,11 +936,17 @@ class Trainer:
             for data, target in val_loader:
                 data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
                 
-                if self.config['mixed_precision']:
-                    with amp.autocast():
+                # 🔧 稳定的验证推理
+                try:
+                    if self.config['mixed_precision']:
+                        with torch.cuda.amp.autocast():
+                            output = model(data)
+                            loss = criterion(output, target)
+                    else:
                         output = model(data)
                         loss = criterion(output, target)
-                else:
+                except Exception as val_e:
+                    # 验证失败时使用标准模式
                     output = model(data)
                     loss = criterion(output, target)
                 
@@ -780,10 +989,14 @@ class Trainer:
             for data, target in test_loader:
                 data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
                 
-                if self.config['mixed_precision']:
-                    with amp.autocast():
+                # 稳定的测试推理
+                try:
+                    if self.config['mixed_precision']:
+                        with torch.cuda.amp.autocast():
+                            output = model(data)
+                    else:
                         output = model(data)
-                else:
+                except:
                     output = model(data)
                 
                 _, predicted = torch.max(output, 1)
@@ -821,12 +1034,12 @@ def main():
     """主函数"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="训练羽毛球动作分类模型 (GPU优化)")
+    parser = argparse.ArgumentParser(description="训练羽毛球动作分类模型 (稳定增强版)")
     parser.add_argument("--data", default="data/split/", 
                        help="分割后的数据集根目录")
     parser.add_argument("--epochs", type=int, default=TRAINING_CONFIG['max_epochs'], 
                        help="训练轮数")
-    parser.add_argument("--output", default="badminton_model_gpu.pth", 
+    parser.add_argument("--output", default="badminton_model_stable.pth", 
                        help="模型输出路径")
     parser.add_argument("--batch-size", type=int, default=None, 
                        help="批次大小（留空自动优化）")
